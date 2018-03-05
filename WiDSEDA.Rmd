@@ -1,0 +1,328 @@
+---
+title: "WIDS DataThon 2018 EDA"
+author: "Author : kimnewzealand"
+date: "Date : 2 March 2018"
+output:
+  html_document:
+    df_print: paged
+  html_notebook:
+    fig_height: 4
+    highlight: pygments
+    theme: spacelab
+  pdf_document: default
+---
+
+## Background
+
+In this Kaggle competition, [ Social Impact for Women in Impoverished Countries WIDS_DataThon_2018 competition](http://www.widsconference.org/datathon-details.html), the aim is to predict the gender of each survey respondent based on demographic and behavioural information from a representative sample of survey respondents from India and their usage of traditional and mobile financial services.
+
+This notebook is an exploratory data analysis of the dataset.
+
+* * *
+
+## Setup
+
+### Load packages
+
+```{r setup, include=TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load packages, message=FALSE, error=FALSE}
+library(data.table)
+library(knitr)
+library(tidyverse)
+library(readxl)
+library(stringr)
+```
+
+## Load Data
+
+**Load Datasets**
+
+The first step will be to load the test data file and train data file. These have been downloaded to a local Kaggle folder offline as there is an agreement step to the Kaggle data terms and conditions and unzipped using 7-zip.
+
+We will use the data.table R package designed for large datasets.
+
+```{r loaddata, error=FALSE, warning=TRUE, comment=FALSE, include=FALSE}
+url <- "https://www.kaggle.com/c/wids2018datathon/data"
+setwd("~/Kaggle/WiDS")
+train <- fread("./train.csv")
+dd2 <- data.frame(read_excel("./WiDSDD2.xlsx"))
+# Keep the value of the original total valriables
+totvar <- dim(train)[2]
+```
+
+
+**Overview**
+
+The train dataset has `r dim(train)[1]` rows and `r totvar` columns. This is is a high dimensional, multivariate dataset.
+
+_The following information is available from the Kaggle discussion forum: _ 
+
+> is_female - the target variable you are going to predict. Note: in the data dictionary, Female is 2, male is 1, while in our transformed data, is_female=1 for female and is_female=0 for male.
+For the rest of the 1000+ column descriptions, please refer to WiDSDataDictionary for details. Please note that data has been processed and some columns were removed to prevent data leakage or to protect privacy.
+
+```{r head}
+head(train[,c(1:10)])
+```
+
+
+Note that the target variable is at position 9 in the train dataset.
+
+Let's remove train IDs for further analysis on the remaining train dataset.
+
+```{r removeid}
+# Remove ID feature from train as this identifier is not necessarily needed in the EDA.
+id <- train$train_id
+train <- train %>% dplyr::select(-train_id)
+```
+
+
+Since this is a survey there might be biases that affect the responses. We do not have any information on the order of the questions. Biases might include stereotyping, desirability to conform to group norms and mindset carry over effects.
+
+### Part 1: Exploratory data analysis
+
+**1.1 Target Variable**
+
+Let's first take a quick look at the target variable, the _is_female_ label variable as a histogram.
+
+```{r targethistogram}
+train %>% 
+      ggplot(aes(as.factor(is_female),fill=as.factor(is_female)),guide=FALSE) + 
+      geom_histogram(stat="count") + 
+      scale_y_continuous(name="Count",labels = scales::comma,limits = c(0,10000)) +
+      xlab("Target") +
+      ggtitle("Histogram of Target Variable is_female") 
+
+table(train$is_female)
+```
+
+We can see that a the number of is_female as a proportion of total is `r round(table(train$is_female)[2]/(table(train$is_female)[1]+table(train$is_female)[2]),2)`. Therefore the classes are balanced. 
+
+**1.2 Response Variables**
+
+*1.2.1 Character Variables*
+
+Check if any variables in the train set are characters using dplyr, and subset the ones that do not have a very high proportion of white space.
+
+```{r checkchars}
+# Select the subset of character variables and values
+ischars <- train %>% select_if(is.character)
+head(ischars)
+# Create a vector of the count of white space for each column, with a custom function
+ischarsws <- sapply(ischars,function(x) table(x =="")["TRUE"])
+# Subset the variables where the whitespace count is less than 17,000
+ischarsws[ischarsws<17000]
+```
+Of the `r length(ischars)` character variables, this subset of two variables may contribute to the prediction. Let's take a quick look at the some of the values in the variables.
+
+```{r lang}
+table(train$LN2_RIndLngBEOth)[1:10]
+table(train$LN2_WIndLngBEOth)[1:10]
+```
+
+They are not listed in the data dictionary but we can infer that they relate to language questions. Let's remove the character variables from train except for these two variables.
+
+```{r remove chars}
+charstoremove <- ischars %>% select(-LN2_RIndLngBEOth,-LN2_WIndLngBEOth)
+# Use dplyr select to remove the column names of the charstoremove
+train <- train %>% select(-one_of(names(charstoremove)))
+```
+
+
+*1.2.3 Numeric variables*
+
+Check if any variables in the train set are numeric using dplyr, and calculate the sum of NAs for each column using purrr.
+
+```{r checknums}
+# Select the subset of numeric variables and values. Note that is.numeric includes integers
+isnum <- train %>% select_if(is.numeric)
+# Create a vector of the count of NA for each column using map from purrr package
+isnumna <- map(isnum, ~sum(is.na(.))) 
+```
+
+We will remove the high proportion of numeric NAs from the train set. 
+
+```{r remove num NAs}
+# Use dplyr select to remove the column names vector
+train <- train %>% select(-one_of(names(isnumna[isnumna>16000])))
+```
+
+Let's investigate how many of the numeric variables are in fact binary variables, assuming that binary will take on one of two values and there are no not answered values such as 99.
+
+```{r}
+binary <- function(x) {
+  ifelse(length(unique(x))>2,FALSE,TRUE)
+}
+# Create a vector of the count of NA for each column using map from purrr package
+isbinaryornot <- map(isnum, ~binary(.))
+# Sum is binary or not
+sumbinary <- sum(isbinaryornot==TRUE)
+```
+
+*1.2.4 Logical variables*
+
+Check if any variables in the train set are logicals using dplyr, and check the number of NA values.
+
+```{r checklogi}
+# Select the subset of logical variables and values
+islog <- train %>% select_if(is.logical)
+# Sum the missing values 
+sum(is.na(islog))-dim(islog)[1]*dim(islog)[2]
+```
+
+All the logical variables have missing values therefore we can remove these variables from the dataset for the rest of the EDA.
+
+```{r remove log}
+train <- train %>% select(-one_of(names(islog)))
+```
+
+
+Therefore we saw that the train set originally contained `r totvar` variables, made up of 1 testid,  `r length(ischars)` character, `r length(islog)` logical and `r length(isnum)` numeric variables. Of these numeric variables We have at least `r sumbinary` binary variables. 
+
+We can potentially reduce the train set to `r dim(train)[2]` variables for model training.
+
+**1.3 Data Dictionary Comparison**
+
+Note there are less variables in the data dictionary ( `r dim(dd2)[1]` ) than in the train set ( `r totvar` ) so it appears we are missing some variable descriptions.  Let's compare the two datasets. 
+
+```{r diffs2}
+# Number of columns in data dictionary but not in train dataset. These are likely to be the columns removed to protect privacy as described above. 
+length(setdiff(dd2$`Column.Name`, names(train)))
+# Columns in train data but not in data dictionary
+setdiff(names(train), dd2$`Column.Name`)
+```
+
+**1.4 Variable Summaries**
+
+The questions appear to be grouped into Demographic (DL and DG), Mobile (MT), Financial (FF, FB, FL and GN) and Insurance (FB).
+
+**1.4.1 Demographic information**
+
+```{r}
+# DL0. Who is the main income earner in your household?
+table(train$DL0) # all answered. (Top 10 variable importance). This is a a binary answer, no further engineering
+# DL1. In the past 12 months, were you mainly...?
+table(train$DL1) # all answered (Top 10 variable importance). This is a candidate for further feature enginnering
+# DL2. What is your primary job (i.e., the job where you sp
+table(train$DL2) # Do they prefer not to say? (Top 10 variable importance). This has many NAS
+# DG1. What year were you born?(Top 10 variable importance)
+summary(train$DG1) # all answered. 
+# DG3. What is your marital status? (Top 10 variable importance)
+table(train$DG3) # all answered
+# DG4. What is your highest level of education? (Top 10 variable importance)
+summary(train$DG4)  # all answered
+# DG5.4.Do you have any of the following type of official id (Top 10 variable importance)
+summary(train$DG4)
+# DG6.How are you related to the household head? (Top 10 variable importance)
+summary(train$DG6)
+# DG8.A.How many adults and children do you have in th (Top 10 variable importance)
+summary(train$DG8a)
+```
+
+
+**1.4.2 Mobile phone questions**
+
+The questions which begin with MT are related to phone usage.
+
+```{r mobile}
+# MT1.How many people in your household have a mobile phone?
+table(train$MT1)
+# MT1A.Who decides on who should have a phone in your household? (Top 10 variable importance)
+summary(train$MT1A)
+# MT2.Do you personally own a mobile phone?
+table(train$MT2)
+#  MT3_1? This question is not in the data dictionary?
+table(train$MT3_1)
+# MT6.How did you obtain your phone? (Top 10 variable importance) 
+summary(train$MT6)
+```
+
+**1.4.3 Financial Services questions**
+
+```{r financial}
+# FF1. Do you personally have a bank account that is registered
+table(train$FF1)
+# FF2. Do you usually make transactions with your bank account yourself or does 
+summary(train$FF2)
+table(train$FF2)
+```
+
+**1.4.4 Financial Planning**
+
+```{r}
+# FL2.When you make a plan, how often do you keep it?
+summary(train$FL2)
+# FL4.What or who do you depend on the most for financial..
+table(train$FL4)
+```
+
+**1.4.5 Location**
+
+The location questions appear to begin with AA.
+
+```{r location}
+# AA3. Zone
+summary(train$AA3)
+# AA4 no description
+summary(train$AA4)
+# AA5. Town Class
+summary(train$AA5)
+# AA14 no description
+summary(train$AA14)
+hist(train$AA14)
+# AA15
+summary(train$AA15)
+```
+
+The NA for each of AA5 and AA6 add up to the total number of observations. There seems to be a question missing for whether the respondents live in a town or a village. This will be feature engineered.
+
+AA14 question is not in the data dictionary, but it has a high outlier 99,999. These will be removed through imputation.
+
+
+**2.1 EDA Plots**
+
+**2.1.1 Plot religion versus zone**
+
+```{r plot1}
+# Plot religion versus Zone DG3A What is your religion? "1=Christianity\n2=Islam\n3=Sikhism\n4=Hinduism\n5=Buddhism\n6=No religion\n96=Other (Specify)\n99=DK" and AA3. Zone 1=North 2=East 3=West 4=South
+train %>% filter(DG3A!=96 &DG3A!=99) %>% 
+      ggplot() +
+      geom_jitter(aes(DG3A,AA3)) +
+      xlab("DG3A What is your religion?") +
+      ylab("AA3. Zone")
+```
+
+
+**2.1.2 Plot working versus main earner**
+
+```{r plot2}
+# Plot DL0. Who is the main income earner in your household? v DL1. In the past 12 months, were you mainly...?
+train %>%  filter(DL1!=96 & DL1!=99) %>%
+      ggplot() +
+      geom_jitter(aes(DL0,DL1)) +
+      xlab("DL0. Who is the main income earner in your household?") +
+      ylab("DL1. In the past 12 months, were you mainly...?")
+```
+
+**2.1.3 Plot household head versus marital status**
+
+```{r plot3}
+# Plot DG6.How are you related to the household head? v DG3. What is your marital status?
+train %>% filter(DG3!=96 &DG3!=99&DG6!=99) %>% 
+      ggplot() +geom_jitter(aes(DG6,DG3)) + 
+      xlab("DG6.How are you related to the household head?") +
+      ylab("DG3. What is your marital status?")
+```
+
+**2.1.4 Plot phone versus marital status**
+
+```{r plot4}
+# Plot MT6.How did you obtain your phone? v DG3. What is your marital status?
+train %>% filter(DG3!=96 & DG3!=99 & MT6!=96 & MT6!=99) %>% 
+      ggplot() +
+      geom_jitter(aes(MT6,DG3)) + 
+      xlab("MT6.How did you obtain your phone?") +
+      ylab("DG3. What is your marital status?")
+```

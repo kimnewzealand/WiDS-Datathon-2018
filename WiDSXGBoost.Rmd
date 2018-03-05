@@ -1,0 +1,595 @@
+---
+title: "WIDS DataThon 2018"
+author: "kimnewzealand"
+date: "27 February 2018"
+output:
+  html_notebook:
+    fig_height: 4
+    highlight: pygments
+    theme: spacelab
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+## Background
+
+In this Kaggle competition, [ Social Impact for Women in Impoverished Countries WIDS_DataThon_2018 competition](http://www.widsconference.org/datathon-details.html), the aim is to predict the gender of each survey respondent based on demographic and behavioural information from a representative sample of survey respondents from India and their usage of traditional and mobile financial services.
+
+This notebook includes model training to create the predictions file for submission to Kaggle.
+
+Submissions are evaluated on area under the ROC curve between the predicted probability and the observed target variable is_female.
+
+* * *
+
+### Setup
+
+## Load packages
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load packages, error=FALSE, message=FALSE, warning=FALSE}
+library(data.table)
+library(knitr)
+library(tidyverse)
+library(stringr)
+library(readxl)
+library(caret)
+library(xgboost)
+library(pROC)
+```
+
+```{r sessioninfo}
+sessionInfo()
+```
+
+## Load Data
+
+**Load datasets**
+
+The first step will be to load the test data file and train data file. These have been downloaded to a local Kaggle folder offline as there is an agreement step to the Kaggle data terms and conditions and unzipped using 7-zip.
+
+We will use the data.table R package designed for large datasets.
+
+```{r loaddata, error=FALSE, warning=FALSE, comment=FALSE, include=FALSE}
+url <- "https://www.kaggle.com/c/wids2018datathon/data"
+setwd("~/Kaggle/WiDS")
+train <- fread("./train.csv")
+test <- fread("./test.csv")
+dd2 <- data.frame(read_excel("./WiDSDD2.xlsx"))
+```
+
+**Overview**
+
+The train dataset has `r dim(train)[1]` rows and `r dim(train)[2]` columns.
+
+_The following information is available from the Kaggle discussion forum: _ 
+
+> is_female - the is_female variable you are going to predict. Note: in the data dictionary, Female is 2, male is 1, while in our transformed data, is_female=1 for female and is_female=0 for male.
+For the rest of the 1000+ column descriptions, please refer to WiDSDataDictionary for details. Please note that data has been processed and some columns were removed to prevent data leakage or to protect privacy.
+
+From reviewing the data dictionary, the variables are all numeric or integers. There are also a large number of variables, therefore we will initially look for ways to perform dimension reduction. 
+
+From reviewing the data dictionary, the variables are all numeric or integers. There are also a large `r dim(train)[2]` variables, therefore we will initially look for ways to perform dimension reduction. Note there are less variables in the data dictionary `r dim(dd2)[2]` so it appears we are missing some variable descriptions.  It appears that the AB questions are also missing from our datasets.
+
+Check if any variables are characters, and have large count, using a threshold of 14,000.
+
+```{r checkchars}
+# select character variables with non white space
+ischars <- train %>% select_if(is.character)
+ischarstrue <- sapply(ischars,function(x) table(x =="")["TRUE"])
+ischarstrue[ischarstrue < 14000]
+# Convert these character variables to factors so that they retain a value when the train and test sets are converted to numeric
+train$LN2_RIndLngBEOth <- as.factor(train$LN2_RIndLngBEOth)
+train$LN2_WIndLngBEOth <- as.factor(train$LN2_WIndLngBEOth)
+test$LN2_RIndLngBEOth <- as.factor(test$LN2_RIndLngBEOth)
+test$LN2_WIndLngBEOth <- as.factor(test$LN2_WIndLngBEOth)
+```
+
+Convert the train and test datasets to numeric classes using the map function from the [purr](https://www.rdocumentation.org/packages/purrr/versions/0.2.2.2) R package, for XGBoost modelling.
+
+```{r numericdata, warning=FALSE}
+train <- data.frame(map(train, ~as.numeric(.)) )
+test <- data.frame(map(test, ~as.numeric(.)) )
+```
+
+
+* * *
+
+### Part 1: EDA
+
+See separate script, WiDSEDA.Rmd
+
+### Part 2: Data Cleaning
+
+Let's clean the train and test datasets variable by variable based on the exploratory data analysis.
+
+2.1 Remove train IDs
+
+```{r removeid}
+# Remove ID feature from train as this identifier is not needed in the training. The id will be left in the test set for the predictions.
+train <- train %>% dplyr::select(-train_id)
+id <- test$test_id
+test <- test %>% dplyr::select(-test_id)
+```
+
+2.2 Remove near zero variance variables
+
+Removing variables with near zero variance using the [caret](https://cran.r-project.org/web/packages/caret/index.html) R package.
+
+```{r nearzerovar}
+near.zero <- nearZeroVar(train,saveMetrics=TRUE)
+variables <- row.names(subset(near.zero,near.zero$nzv==FALSE))
+train <- data.frame(train)[,variables]
+# Perform the same action on the test set, after removing the "is_female" in position 9 from variables as this is to be predicted in the test set
+test <- data.frame(test)[,variables[-9]]
+```
+
+2.3 Missing Values
+
+Next we will extract and view the variables in more detail that have value NA, which represent the missing values in the dataset. With dplyr we can call functions from different R packages directly inside the dplyr functions. We will use the [stringr](https://cran.r-project.org/web/packages/stringr/vignettes/stringr.html) R package with dplyr to view a summary of the NAs. We will also use the [purrr](https://www.rdocumentation.org/packages/purrr/versions/0.2.2.2) to apply the sum function across multiple variables.
+
+```{r missing}
+# Use the base summary function for result summaries not dplyr. This will provide us with the ranges of the variables including the minimums.
+s <- summary(train)  
+#  Extract and view the frequency of NA's from the summary s we just created. Use str_detect from stringr package. 
+s %>% 
+      data.frame() %>% 
+      filter(str_detect(Freq,"NA")) 
+# Since there are variables with very high proportion of NAs, let's remove these variables assuming they will not add predictive value
+# Using map function from the purr package sum the NAs for each column
+count_na <- map(train, ~sum(is.na(.))) 
+# Remove columns with more than % NA values using an index
+index1 <- which(count_na < 0.9*dim(train)[1])  
+train <- train[, index1]
+# Perform the same action on the test set, after removing the "is_female" in position 8 from variables as this is to be predicted in the test set
+index2 <-index1[-8]
+index2[index2>8]<-as.integer(index2[index2>8]-1)
+test <- test[,index2]
+```
+
+2.4 Imputation of missing values
+
+We are going to review the columns with missing values to impute the values. We will create a merged dataset from the data dictionary. Then using the replace_na function from the [tidyr](https://cran.r-project.org/web/packages/tidyr/index.html) R package.
+
+```{r impute}
+#  Extract and view the frequency of NA's again
+s <- summary(train) 
+missing <- s %>% 
+      data.frame() %>% 
+      filter(str_detect(Freq,"NA")) 
+# Remove the white space and rename columns to make it easier to merge into a ddmissing dataframe
+missing$Var2 <- missing$Var2 %>% 
+      as.character() %>%
+      trimws()
+missing$Freq <- as.character(missing$Freq)
+names(missing) <- c("Column.Name","Freq")
+ddmissing <- merge(dd2,missing,by = "Column.Name")
+ddmissing
+# We see that MT1A has high variable importance from the EDA so we will replace the NA values with 99, which is the existing NA category in this questions. Note the starter mobile question MT1 and MT2 have no NAs. 
+train <- train %>% 
+   replace_na(list(MT1A=99))
+# We see that this  has high variable importance MT6.How did you obtain your phone? (Top 10 VI) GOT NAs. Replace with existing category 99
+train <- train %>% 
+   replace_na(MT6=99)
+# We see that this  has high variable importance DL2. What is your primary job (i.e., the job where you sp Replace with existing category 96
+train <- train %>% 
+   replace_na(DL2=96)
+# We see that this  has high variable importance DL1. In the past 12 months, were you mainly...? Replace with existing category 96
+train <- train %>% 
+   replace_na(DL1=96)
+# NA fix replace all remaining NA with mode. We will not use this replacement as XGboost can handle missing values
+train <- train %>% 
+  replace(.,is.na(.), mode)
+test <- test %>% 
+  replace(.,is.na(.), mode)
+```
+
+2.5 Imputation of the median
+
+The variable train$AA14 has some outliers, and it is in the top 10 in the variable importance but it is not in the data dictionary. We will impute the median on this variable. 
+
+```{r AA14median}
+# Impute the outlier to the median of this variable
+train$AA14[train$AA14==99999] <- median(train$AA14)
+test$AA14[test$AA14==99999] <- median(test$AA14)
+# Check the imputation
+train %>% select(AA14) %>% filter(AA14==99999) %>% head()
+summary(train$AA14)
+```
+
+
+
+* * *
+
+## Part 3: Modeling
+
+3.1. **MODEL SELECTION**
+
+Since we know the outcome discrete variable, we will use a supervised machine learning algorithm. It also appears from our EDA, the is_female variable is 0 or 1, we will potentially need a classification model. 
+The algorithm that we will use is XGBoost where we can choose between the two booster methods. Initially we will use default XGBoost parameters and perform some initial feature engineering.
+
+We will use AUC, as our metric and ultimately select the final model based on the highest value. See this post for more information on these [curves](http://blog.yhat.com/posts/roc-curves.html)
+
+In R, the XGBoost package uses the following:
+
+- A matrix of input data instead of a data frame. 
+
+- Only numeric variables.
+
+- The is_female variable separately, which we will code to y.
+
+
+We will convert the categorical variables into dummy variables using one hot encoding.  It is recommended by the R package XGBoost's vignette to use  xgb.DMatrix.
+
+XGBoost will also handle NA missing values so these will be left in the train and test datasets.
+
+3.2. **FEATURE ENGINEERING**
+
+3.2.1 Add new features
+
+We will create new features for both the train and test sets, based on our EDA and previous runs of the modelling.
+
+A. Age brackets
+
+DG1 relates to what year the respondent was born. We can bin into age brackets based on the survey that is dated [2016](http://finclusion.org/blog/fii-updates/financial-inclusion-in-india-lessons-from-the-2016-fii-data.html)
+
+```{r agegroups}
+# Check the range of the years born in DG1
+range(train$DG1)
+# Set the breaks
+agebreaks <- c(1916,1956,1991,1997,2001)
+# Cut the train set into a new variable called DG1A
+train$DG1A <- cut(train$DG1, agebreaks, include.lowest=T)
+# Rename the levels
+levels(train$DG1A) <- rev(c("15 to 18 years","19 to 24 years","25 to 59 years","60 years and over"))
+# Convert to numeric
+train$DG1A<-unclass(train$DG1A) %>% as.numeric
+# Do the same for the test set. Cut the test set
+test$DG1A <-cut(test$DG1, agebreaks, include.lowest=T)
+# Rename the levels
+levels(test$DG1A) <- rev(c("15 to 18 years","19 to 24 years","25 to 59 years","60 years and over"))
+# Convert to numeric
+test$DG1A<-unclass(test$DG1A) %>% as.numeric
+# Check the range of the new variable DG1A  has been converted from bins to numeric values
+range(train$DG1A)
+```
+
+B. Live in town or village
+
+We will create new features for whether a respondent lives in town or not.
+
+```{r townvillage}
+train$AA5ornot <- ifelse(is.na(train$AA5),0,1)
+test$AA5ornot <- ifelse(is.na(test$AA5),0,1)
+```
+
+C. Parent or not
+
+We will create new features for whether a respondent is a parent or not, and a grandparent or not based on the question: DG6.How are you related to the household head?
+"1=Myself\n2=Spouse\n3=Son/Daughter\n4=Father/Mother\n5=Sister/Brother\n6=Grandchild\n7=Other relative\n9=Other non-relative\n99=DK"
+
+```{r parent}
+train$DG6parent <- ifelse(train$DG6==1 |train$DG6==2,1,0)
+train$DG6gparent <- ifelse(train$DG6==4 ,1,0)
+test$DG6parent <- ifelse(test$DG6==1 |test$DG6==2,1,0)
+test$DG6gparent <- ifelse(test$DG6==4 ,1,0)
+```
+
+D. Working or not
+
+We will create new features for whether a respondent is stay at home or not or a student or not.
+
+```{r working}
+train$DL1household <- ifelse(train$DL1==7 ,1,0)
+train$DL1student <- ifelse(train$DL1==8 ,1,0)
+test$DL1household <- ifelse(test$DL1==7 ,1,0)
+test$DL1student <- ifelse(test$DL1==8 ,1,0)
+```
+
+E. Bought phone or not
+
+We will create new features for whether a respondent bought their phone for themself or not.
+
+```{r phone}
+train$MT6phone <- ifelse(train$MT6==1,1,0)
+test$MT6phone <- ifelse(test$MT6==1,1,0)
+```
+                           
+F.AA14 grouping
+
+We will also group the unknown continuous variable variable AA14 with a large number of frequency values.
+
+```{r AA14}
+range(train$AA14)
+train$AA14_1<- ifelse(train$AA14<2000,1,
+                      ifelse(train$AA14<4000,2,3)
+                      )
+test$AA14_1<- ifelse(test$AA14<2000,1,
+                      ifelse(train$AA14<4000,2,3)
+                      )
+```
+G. Cohabiting or not
+
+We will create new features for whether a respondent is cohabiting or not.
+
+```{r cohab}
+# DG3. What is your marital status?
+train$DG3_1<- ifelse(train$DG3==7|train$DG3==8,1,0)
+test$DG3_1<- ifelse(test$DG3==7|train$DG3==8,1,0)
+```
+
+H. Financially independent
+
+We will create new features for whether a respondent is financially independent or not.
+
+```{r indep}
+train$FL4_1<- ifelse(train$FL4==1,1,0)
+test$FL4_1<- ifelse(test$FL4==1,1,0)
+```
+
+3.3. **DATA SPLITTING**
+
+The train data set is further split into training (70%) and validation (30%) sets for cross validation using caret, after being randomised. The function createDataPartition can be used to create stratified random splits of a data set.
+
+```{r split}
+# Create a set of training and valid sets that will be used in the XGBboost package, keeping the target vaiable as numeric
+inTrain <- createDataPartition(y = train$is_female, p = 0.7, list = F)
+training <- train[inTrain,]
+valid <- train[-inTrain,]
+
+# Set the target variable to be a character factor with levels one and two for use in the training in the caret XGBoost
+train$is_female <- as.factor(train$is_female)
+levels(train$is_female)[levels(train$is_female)=="0"] <- "one"
+levels(train$is_female)[levels(train$is_female)=="1"] <- "two"
+
+# Create a set of training and valid sets that will be used in the caret package, with the target vaiable as factor
+inTrain <- createDataPartition(y = train$is_female, p = 0.7, list = F)
+training2 <- train[inTrain,]
+valid2 <- train[-inTrain,]
+```
+
+3.4. **DATA MATRIX**
+
+```{r matrix}
+# is_female numeric outcome y (label) on training set
+y = training$is_female
+
+# To use advanced features xgboost, as recommended, we'll use xgb.DMatrix function to convert a matrix or a dgCMatrix into a xgb.DMatrix object, which contains a list with dgCMatrix data  and numeric label: 
+
+dtrain <- xgb.DMatrix(data = data.matrix(training[ ,-training$is_female]),
+                 label = y)
+dvalid <- xgb.DMatrix(data = data.matrix(valid[ ,-valid$is_female]), 
+                      label = valid$is_female)
+
+
+dtest <- xgb.DMatrix(data.matrix(test))
+# We use watchlist parameter to measure the progress with a second dataset which is already classified. 
+watchlist <- list(train=dtrain, test=dvalid)
+# Check that dtest has the same number of rows as the original test file, 27285 rows
+nrow(dtest)
+```
+
+3.5. **MODEL PARAMETERS**
+
+The following are parameters available for XGBoost R package base don the [documentation](https://xgboost.readthedocs.io/en/latest/):
+
+**General parameters**  
+
+- booster  
+We will run models for boosters gblinear and gbtree. 
+nthread [default=maximum cores available] silent[default=0] to not see the running messages
+
+**Booster parameters**
+
+For each of these boosters, there are booster parameters, these are common between the two:
+
+- nrounds - Observe the number chosen for nrounds for any overfitting using CV. the max number of iterations.
+- alpha[default=1] and lambda [default=0] to control regularisation
+
+Parameters for Tree Booster also include:  
+
+- eta[default=0.3][range: (0,1)] controls the learning rate.  
+- max_depth[default=6][range: (0,Inf)] controls the depth of the tree- tuned using CV. Higher value of max_depth will create more deeper trees or we can say it will create more complex model.Higher value of max_depth may create overfitting and lower value of max_depth may create underfitting.All depends on data in hand.  
+- min_child_weight[default=1][range:(0,Inf)] In simple words, it blocks the potential feature interactions to prevent overfitting. Should be tuned using CV. It is like number of observations a terminal node.If the tree partition step results in a leaf node with the sum of instance weight less than min_child_weight, then the building process will give up further partitioning. In linear regression mode, this simply corresponds to minimum number of instances needed to be in each node.  
+- subsample[default=1][range: (0,1)] controls the number of samples (observations) supplied to a tree.  
+- colsample_bytree[default=1][range: (0,1)]control the number of features (variables) supplied to a tree. Randomly choosing the number of columns out of all columns or variables at a time while tree building process.You can think of mtry parameter in random forest to begin understanding more about this.Higher value may create overfitting and lower value may create underfitting.One needs to play with this value.  
+- gamma (Minimum Loss Reduction) One can play with this parameter also but mostly other parameters are used for model tuning.  
+
+**Learning Task Parameters**
+
+These parameters specify methods for the loss function and model evaluation. In addition to the parameters listed below, you are free to use a customized objective / evaluation function.
+
+Objective[default="binary:logistic"]
+
+eval_metric [no default, depends on objective selected]
+These metrics are used to evaluate a model's accuracy on validation data. For regression, default metric is RMSE.
+
+One of the simplest way to see the training progress in XGBoost is to set the verbose option to # verbose = 0, no message but use print.every.n,verbose = 1, print evaluation metric, verbose = 2, also print information about the tree.
+
+3.6. **CROSS VALIDATION**
+
+Using the xgb.cv function for 5-fold cross validation, this function returns CV error, which is an estimate of test or out of sample  error. 
+
+```{r xgbcv}
+# set random seed, for reproducibility 
+set.seed(1234)
+# Using booster gbtree, with a large nround=50 
+xgbcv <- xgb.cv(params = list(
+      # booster = "gbtree", 
+      objective = 'binary:logistic'),
+      metrics = list("rmse","auc"),
+      label=y,
+      data = dtrain,
+      nrounds = 50,
+      nfold = 5, # 5 fold CV
+      showsd = T, 
+      print_every_n = 10, # when verbose =0
+      # early_stopping_rounds = 5, 
+      verbose=1,
+      prediction = T)
+ 
+#  nround best iteration is, based on the min test rmse:
+it <-  which.min(xgbcv$evaluation_log$test_rmse_mean)
+bestiteration <-  xgbcv$evaluation_log$iter[it]
+bestiteration
+```
+
+
+Plot RMSE for the dtrain cross validation.
+
+```{r rmse}
+# Plot the RMSE from the CV
+xgbcv$evaluation_log %>%
+   dplyr::select(iter,train_rmse_mean,test_rmse_mean) %>%
+  gather(TestOrTrain, RMSE, -iter) %>%
+  ggplot(aes(x = iter, y = RMSE, group = TestOrTrain, color = TestOrTrain)) + 
+  geom_line() + 
+  theme_bw()
+```
+
+
+```{r cvauc}
+# Calculate AUC for the xgbcv
+xgbcv.ROC <- roc(response = y,
+               predictor = xgbcv$pred)
+# Area under the curve: 1?
+xgbcv.ROC$auc
+```
+
+This model appears to set the AUC to 1, we will look to use caret for the model training.
+
+3.7. **MODEL TRAINING**
+
+One way to measure progress in learning of a model is using xgb.train, providing a second dataset already classified. Therefore it can learn on the first dataset and test its model on the second one. Metrics are measured after each round during the learning. However we can also [use caret to train using xgbTree to compare models.](blog.revolutionanalytics.com/2016/05/using-caret-to-compare-models.html)
+
+In this model training we will tune the hyper parameters, although this is computationally expensive way to train a model. 
+
+We will use the following functions:
+
+- expand.grid function to make a data.frame with every combination of hyperparameters 
+- caret::trainControl to specify the type of cross validation (here use 5-fold cross validation)
+- caret::train to search over the grid of hyperparameter combinations to find the model that maximises ROC
+
+```{r tuning, message=FALSE}
+# Set random seed, for reproducibility 
+set.seed(1234)
+# Set expand.grid
+xgb.grid <- expand.grid(nrounds = c(bestiteration, 100), # Set the number of iterations from the xgb.cv and providing another higher value for comparison
+                        eta = seq(from=0.2, to=1, by=0.2), # shrinkage
+                        max_depth = c(6,8),
+                        colsample_bytree = c(0.2, 0.8), # variables per tree. default 1
+                        gamma = c(0,1), # default 0
+                        min_child_weight = c(1,10),
+                        subsample=0.8) # default 1
+
+
+# Set training control
+cntrl <- trainControl(method = "repeatedcv",   # 5 fold cross validation
+                     number = 2,		# do 2 repetitions of cv
+                     repeats = 2, # repeated 5 times
+                     summaryFunction=twoClassSummary,	# built-in function to calculate the area under the ROC curve, to compare models
+                     classProbs = TRUE,
+                     allowParallel = TRUE,
+                     verboseIter = FALSE)
+
+# Train model with gbtree and params above using caret 
+tuningmodel <- train(x=training2[,-9],
+             y=training2$is_female, # target vector should be non-numeric factors to identify our task as classification, not regression.
+             method="xgbTree",
+             metric="ROC",
+             trControl=cntrl,# specify cross validation 
+             tuneGrid=xgb.grid, # Which hyperparameters we'll test
+             maximize = TRUE) 
+
+# View the model results
+tuningmodel$bestTune
+
+# Plot the performance of the training models
+# scatter plot of the AUC against max_depth and eta
+ggplot(tuningmodel$results, aes(x = as.factor(eta), y = max_depth, size = ROC, color = ROC)) + 
+      geom_point() + 
+      ggtitle("Scatter plot of the AUC against max_depth and eta") +
+      theme_bw() + 
+      scale_size_continuous(guide = "none") +
+      scale_colour_gradient(low = "black", high="yellow")
+# Plot the results of the grid combinations  
+plot(tuningmodel)
+```
+Based on the tuning we will now train our "best model", bst with selected parameters.
+  
+```{r bestmodel} 
+# Set expand.grid
+xgb.grid <- expand.grid(nrounds = 100, # Set the maximum number of iterations from the grid search
+                        eta = 0.2, # shrinkage
+                        max_depth = 8,
+                        colsample_bytree = 0.8, # variables per tree. default 1
+                        gamma = 0, # default 0
+                        min_child_weight = 1,
+                        subsample=1) # default 1
+
+bst <- train(x=training2[,-9],
+             y=training2$is_female, # Target vector should be non-numeric factors to identify our task as classification, not regression.
+             method="xgbTree",
+             metric="ROC",
+             trControl=cntrl,# Specify cross validation 
+             tuneGrid=xgb.grid,
+             maximize = TRUE) # Which hyperparameters we'll test
+
+# View the model results
+bst$bestTune
+
+### xgboostModel Predictions and Performance
+# Make predictions using the test data set
+xgb.pred <- ifelse(predict(bst,valid, type = "raw")== "two", 1, 0)
+ 
+#Look at the confusion matrix  
+confusionMatrix(xgb.pred,valid$is_female)   
+ 
+#Draw the ROC curve using the pRoc package
+xgb.probs <- predict(bst,valid,type="prob")
+xgb.ROC <- roc(predictor=xgb.probs$one,
+               response=valid$is_female)
+xgb.ROC$auc
+# Area under the curve
+plot(xgb.ROC,main="xgboost ROC")
+```
+
+Plot the variable importance of this best model, bst.
+
+```{r varimp}
+# Variable Importance
+varimpxgb <- varImp(bst)$importance %>% 
+  mutate(Column.Name=row.names(.)) %>%
+  arrange(-Overall)
+ddvarimp <- merge(dd2,varimpxgb,by = "Column.Name")  
+ddvarimp[1:10,]
+positions <- varimpxgb[1:10,]$Column.Name
+ggplot(varimpxgb[1:10,]) + geom_bar(aes(Column.Name,Overall),stat="identity") + coord_flip() + scale_x_discrete(limits = positions)
+```
+
+One of our engineered features, DL1household, contributes second in the variable importance.
+
+## Part 4: Predictions
+
+Make a prediction on the test set and create submission file to be loaded to Kaggle. Once loaded Kaggle will provide a score as AUC on the _is_female_ predictions.
+
+```{r predictions test}
+# Create a prediction file 
+predicttest <- ifelse(predict(bst,test, type = "raw")== "two", 1, 0)
+```
+  
+
+```{r subfile}
+# Create Kaggle Submission File Female is 2, male is 1, while in our transformed data, is_female=1 for female and is_female=0 for male.
+my_solution <- data.frame(id,predicttest)
+names(my_solution) <- c("test_id","is_female")
+# Check the number of rows in the solution file is 27285
+nrow(my_solution)
+# Write solution to file submissionFile1.csv
+write.csv(my_solution, file = "submissionFileC.csv", quote=F, row.names=F)
+```
+
+
